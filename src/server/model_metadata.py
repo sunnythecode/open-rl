@@ -52,6 +52,9 @@ class TrainingModelMetadata(BaseModel):
   # deployment dtype (OPEN_RL_DTYPE). See worker_dtypes.
   trainer_dtype: Dtype | None = None
   sampler_dtype: Dtype | None = None
+  # None on records stored before master_dtype existed. Those trained their
+  # weights in the trainer dtype. See worker_master_dtype.
+  master_dtype: Dtype | None = None
   status: str = "active"
   updated_at: float = 0.0
   completed_at: float | None = None
@@ -65,6 +68,14 @@ class TrainingModelMetadata(BaseModel):
     them, or a bare base-model sampling session, gets the deployment dtype."""
     fallback = deployment_dtype()
     return self.trainer_dtype or fallback, self.sampler_dtype or fallback
+
+  def worker_master_dtype(self) -> str:
+    """The storage dtype of the trained weights. A record from before
+    master_dtype existed keeps what it ran with: float32 adapters for LoRA,
+    the trainer dtype for full fine-tuning."""
+    if self.master_dtype is not None:
+      return self.master_dtype
+    return "float32" if self.fine_tuning_type == "lora" else self.worker_dtypes()[0]
 
   def shares_gpu(self) -> bool:
     """Whether other workers may time-slice this job's GPUs. An FFT worker

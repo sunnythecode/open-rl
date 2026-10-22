@@ -86,6 +86,26 @@ def deployment_dtype(env: Any = None) -> str:
   return value
 
 
+# Storage dtype of the weights being trained and of their AdamW moments: the
+# fp32 master weights of mixed-precision training. trainer_dtype stays the
+# compute dtype, and the sampler gets the weights cast to it. The only other
+# value allowed is trainer_dtype itself, which is pure bf16 training when that
+# is bfloat16: an Adam update below about 2^-9 of a bf16 weight is rounded away.
+DEFAULT_MASTER_DTYPE = "float32"
+
+
+def check_master_dtype(fine_tuning_type: str, trainer_dtype: str, master_dtype: str) -> None:
+  """Raise ValueError unless master_dtype is float32 or trainer_dtype. A LoRA
+  adapter is always float32: both LoRA trainers keep it there."""
+  allowed = ("float32",) if fine_tuning_type == "lora" else tuple(dict.fromkeys(("float32", trainer_dtype)))
+  if master_dtype not in allowed:
+    raise ValueError(
+      f"openrl.master_dtype={master_dtype} is not supported with openrl.trainer_dtype={trainer_dtype}, "
+      f"fine_tuning_type={fine_tuning_type} (supported: {', '.join(allowed)}): "
+      + ("LoRA adapters train in float32" if fine_tuning_type == "lora" else "master weights are float32 or the trainer dtype")
+    )
+
+
 def check_dtypes(
   trainer_backend: str, fine_tuning_type: str, trainer_dtype: str | None, sampler_dtype: str | None, vllm_sampler: bool = True
 ) -> None:

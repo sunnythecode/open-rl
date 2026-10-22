@@ -316,6 +316,8 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
     self.load_base_model(base_model_name)
     if self.dtype_name != "bfloat16":
       raise ValueError(f"The automodel trainer trains in bfloat16 only, not trainer_dtype={self.dtype_name}")
+    if self.master_dtype_name != "float32":
+      raise ValueError(f"LoRA adapters train in float32 (ADAPTER_DTYPE), not master_dtype={self.master_dtype_name}")
     kwargs: dict[str, Any] = {"torch_dtype": self.model_dtype(), "use_liger_kernel": False, "peft_config": self.peft_config}
     # Qwen3.5 ships a multi-token-prediction head that would run over the whole
     # sequence on every forward; the loss never reads it.
@@ -639,5 +641,6 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       "has_optimizer": has_optimizer,
       "model_id": model_id,
       "dtype": self.dtype_name,
+      "master_dtype": "float32",
       "timestamp": time.time(),
     }

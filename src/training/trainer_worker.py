@@ -9,7 +9,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from training import losses
 from training.distributed import local_rank
-from training.types import DTYPES, Datum, deployment_dtype
+from training.types import DEFAULT_MASTER_DTYPE, DTYPES, Datum, deployment_dtype
 
 # Position marker for a filler pass, see _run_batches.
 FILLER_DATUM_INDEX = -1
@@ -25,6 +25,15 @@ def trainer_dtype_from_env() -> str:
     return deployment_dtype()
   if value not in DTYPES:
     raise ValueError(f"OPEN_RL_TRAINER_DTYPE must be one of {', '.join(DTYPES)}, got {value!r}")
+  return value
+
+
+def master_dtype_from_env() -> str:
+  """OPEN_RL_MASTER_DTYPE, which the worker manager always sets; a worker
+  started by hand keeps float32 master weights, the API's default."""
+  value = os.getenv("OPEN_RL_MASTER_DTYPE") or DEFAULT_MASTER_DTYPE
+  if value not in DTYPES:
+    raise ValueError(f"OPEN_RL_MASTER_DTYPE must be one of {', '.join(DTYPES)}, got {value!r}")
   return value
 
 
@@ -50,6 +59,9 @@ class BaseTrainerWorker:
     # The dtype the API server resolved for this worker's models. Set once per
     # process: a LoRA worker loads its shared base model before any command.
     self.dtype_name = trainer_dtype_from_env()
+    # The storage dtype of the weights this worker trains. Set once per process
+    # too; the base class only records it, each trainer applies it.
+    self.master_dtype_name = master_dtype_from_env()
 
   def model_dtype(self) -> torch.dtype:
     """The torch dtype to load and train in. Raises rather than falling back
@@ -62,10 +74,12 @@ class BaseTrainerWorker:
       )
     return dtype
 
-  def check_command_dtype(self, dtype: str | None) -> None:
-    """Refuse a model whose dtype is not the one this process runs in."""
+  def check_command_dtype(self, dtype: str | None, master_dtype: str | None = None) -> None:
+    """Refuse a model whose dtypes are not the ones this process runs in."""
     if dtype is not None and dtype != self.dtype_name:
       raise ValueError(f"model asks for trainer_dtype={dtype} but this trainer runs in {self.dtype_name}")
+    if master_dtype is not None and master_dtype != self.master_dtype_name:
+      raise ValueError(f"model asks for master_dtype={master_dtype} but this trainer keeps its weights in {self.master_dtype_name}")
 
   def is_ready(self) -> bool:
     """Whether a model is loaded and the worker can serve requests. The

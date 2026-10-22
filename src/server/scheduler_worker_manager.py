@@ -27,7 +27,7 @@ from typing import Any
 
 from kubernetes import client, config
 
-from server.estimator import Footprint, footprint
+from server.estimator import Footprint
 from server.worker_manager import (
   FAILED,
   READY,
@@ -36,7 +36,7 @@ from server.worker_manager import (
   WAITING_FOR_PLACEMENT,
   base_model_of,
   owner_id,
-  role_dtype,
+  role_footprint,
   runtime_of,
   worker_args,
   worker_env,
@@ -99,7 +99,7 @@ def describe_worker(model_id: str, role: str) -> Worker:
   base_model = base_model_of(meta, runtime)
   exclusive = not meta.shares_gpu()
   devices = meta.trainer_gpus if role == "trainer" else 1
-  size = footprint(base_model, meta.fine_tuning_type, role, role_dtype(meta, role))
+  size = role_footprint(meta, base_model, role)
   # Each torchrun rank is its own process with its own host memory.
   size = replace(size, host_request_bytes=size.host_request_bytes * devices, host_limit_bytes=size.host_limit_bytes * devices)
   return Worker(role, runtime, base_model, is_lora, exclusive, meta, size, devices)

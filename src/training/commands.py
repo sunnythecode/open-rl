@@ -31,6 +31,8 @@ class CreateModel(Command):
   full_config: FFTConfig = FFTConfig()
   # The trainer dtype the model was created with. None from an older server.
   dtype: Dtype | None = None
+  # The storage dtype of the trained weights. None from an older server.
+  master_dtype: Dtype | None = None
 
 
 class CreateModelFromState(Command):
@@ -39,6 +41,7 @@ class CreateModelFromState(Command):
   restore_optimizer: bool = False
   fine_tuning_type: FineTuningType = "lora"
   dtype: Dtype | None = None
+  master_dtype: Dtype | None = None
 
 
 class ForwardBackward(Command):

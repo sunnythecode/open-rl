@@ -49,6 +49,8 @@ class LoraTrainingWorker(BaseTrainerWorker):
     self.base_model_name = base_model_name
     self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     dtype = self.model_dtype()
+    if self.master_dtype_name != "float32":
+      raise ValueError(f"LoRA adapters train in float32 (PEFT's autocast_adapter_dtype), not master_dtype={self.master_dtype_name}")
 
     self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, device_map=self.device)
     print("Successfully loaded.")
@@ -200,6 +202,7 @@ class LoraTrainingWorker(BaseTrainerWorker):
       "has_optimizer": include_optimizer and optimizer is not None,
       "model_id": model_id,
       "dtype": self.dtype_name,
+      "master_dtype": "float32",
       "timestamp": time.time(),
     }
     with open(os.path.join(state_path, "metadata.json"), "w") as f:

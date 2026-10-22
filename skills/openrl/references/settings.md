@@ -43,6 +43,15 @@ client = tinker.ServiceClient(
 the checkpoint was saved in. The schema's descriptions say which trainer supports which
 dtype.
 
+`openrl.trainer_dtype` is the compute precision. The trained weights and their AdamW
+moments are stored in `openrl.master_dtype`, which defaults to `float32` (fp32 master
+weights: bf16 compute, with updates accumulated in fp32 so small ones are not rounded
+away). The only other value is the trainer dtype itself; `"openrl.master_dtype":
+"bfloat16"` with a `bfloat16` full fine-tune is pure bf16 training at half the trainer
+memory. LoRA adapters are always `float32`. A restored model must use the master dtype
+the checkpoint trained in; a full fine-tuning checkpoint saved before `master_dtype`
+existed trained in its `dtype`.
+
 Which settings a server accepts depends on how it runs workers: several are refused
 outside the Kubernetes deployment (`openrl.worker_launcher` in capabilities is not
 `scheduler`), and the 400 says so. The decision guide for bigger models, which turns

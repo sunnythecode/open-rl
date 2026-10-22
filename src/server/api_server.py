@@ -40,7 +40,18 @@ from server.vllm_options import split_stop
 from server.worker_manager import LocalWorkerManager, WorkerManager, create_worker_manager, default_metadata, owner_of
 from training import commands
 from training.commands import Command
-from training.types import TRAINER_BACKENDS, Datum, Dtype, FFTConfig, FineTuningType, LoraConfig, check_dtypes, deployment_dtype
+from training.types import (
+  DEFAULT_MASTER_DTYPE,
+  TRAINER_BACKENDS,
+  Datum,
+  Dtype,
+  FFTConfig,
+  FineTuningType,
+  LoraConfig,
+  check_dtypes,
+  check_master_dtype,
+  deployment_dtype,
+)
 
 store = get_store()
 state = get_state_store()
@@ -219,13 +230,22 @@ class Settings(BaseModel):
     default=None,
     description=(
       "Required on every model, including one restored from a checkpoint (where it must match the checkpoint). "
-      "The precision the trainer holds weights, grads and optimizer state in. pytorch: float32 or bfloat16 for full, "
+      "The precision the trainer computes in (forward and backward). The trained weights and their optimizer state are "
+      "stored in openrl.master_dtype. pytorch: float32 or bfloat16 for full, "
       "bfloat16 for lora. automodel: bfloat16. A worker whose GPU cannot run it fails instead of falling back."
     ),
   )
   sampler_dtype: Dtype | None = Field(
     default=None,
     description="Required on every model. The precision the vLLM sampler runs in. Must equal openrl.trainer_dtype for now.",
+  )
+  master_dtype: Dtype | None = Field(
+    default=None,
+    description=(
+      "float32 unless set. The precision the trained weights (fp32 master weights) and their AdamW moments are stored in; "
+      "openrl.trainer_dtype stays the compute precision, and the sampler gets the weights cast to it. float32 or "
+      "openrl.trainer_dtype for full; float32 for lora. A restored model must match the checkpoint."
+    ),
   )
   # The rest apply to full fine-tuning only.
   weight_sync: Literal["delta", "full"] | None = Field(
@@ -478,10 +498,11 @@ async def _extract_and_persist_model_metadata(
   request: Request | None = None,
   checkpoint_kind: FineTuningType | None = None,
   checkpoint_dtype: str | None = None,
+  checkpoint_master_dtype: str | None = None,
 ) -> tuple[str, TrainingModelMetadata]:
   """Resolve the model's configuration from its openrl. settings and persist TrainingModelMetadata once.
-  checkpoint_kind and checkpoint_dtype describe the checkpoint a restored model loads; checkpoint_dtype is
-  None for a checkpoint saved before dtypes were recorded."""
+  checkpoint_kind, checkpoint_dtype and checkpoint_master_dtype describe the checkpoint a restored model loads;
+  the dtypes are None when the checkpoint does not record them."""
   base_model = req.base_model
   if not base_model:
     raise ValueError("base_model is required in request payload")
@@ -533,6 +554,15 @@ async def _extract_and_persist_model_metadata(
   )
   if checkpoint_dtype is not None and settings.trainer_dtype != checkpoint_dtype:
     raise ValueError(f"{SETTINGS_PREFIX}trainer_dtype={settings.trainer_dtype} does not match the checkpoint, which was saved in {checkpoint_dtype}")
+  master_dtype = settings.master_dtype or DEFAULT_MASTER_DTYPE
+  check_master_dtype(fine_tuning_type, settings.trainer_dtype, master_dtype)
+  # Restoring into another master dtype is refused either way: down loses the
+  # low bits, and up starts fp32 masters from bf16 values as if they were exact.
+  if checkpoint_master_dtype is not None and master_dtype != checkpoint_master_dtype:
+    raise ValueError(
+      f"{SETTINGS_PREFIX}master_dtype={master_dtype} does not match the checkpoint, whose weights were trained in {checkpoint_master_dtype}"
+      + ("" if settings.master_dtype else f" (master_dtype defaults to {DEFAULT_MASTER_DTYPE}; set {SETTINGS_PREFIX}master_dtype)")
+    )
   if worker_manager is None and settings.trainer_dtype != (static_dtype := deployment_dtype()):
     raise ValueError(
       f"{SETTINGS_PREFIX}trainer_dtype={settings.trainer_dtype}: this server runs one set of workers in {static_dtype} (OPEN_RL_DTYPE)"
@@ -552,6 +582,7 @@ async def _extract_and_persist_model_metadata(
     trainer_cp=settings.trainer_cp,
     trainer_dtype=settings.trainer_dtype,
     sampler_dtype=settings.sampler_dtype,
+    master_dtype=master_dtype,
   )
   await persist_model_metadata(state, model_id, meta_obj)
 
@@ -918,6 +949,7 @@ async def create_model(req: CreateModelRequest, request: Request) -> dict[str, A
     lora_config=meta.lora_config or {},
     full_config=meta.full_config or {},
     dtype=meta.trainer_dtype,
+    master_dtype=meta.master_dtype,
   )
   req_id = await launch_worker_and_enqueue(command) if worker_manager is not None else await enqueue(command)
   return {"request_id": req_id}
@@ -965,7 +997,9 @@ async def create_model_from_state(req: CreateModelFromStateRequest, request: Req
     req = req.model_copy(update={"base_model": checkpoint["base_model"]})
     if checkpoint.get("dtype") is None:
       print(f"[API_SERVER] WARNING: checkpoint {resolved_path} records no dtype; trusting the client's openrl.trainer_dtype")
-    model_id, meta = await _extract_and_persist_model_metadata(req, request, checkpoint_kind=kind, checkpoint_dtype=checkpoint.get("dtype"))
+    model_id, meta = await _extract_and_persist_model_metadata(
+      req, request, checkpoint_kind=kind, checkpoint_dtype=checkpoint.get("dtype"), checkpoint_master_dtype=checkpoint_master_dtype(checkpoint, kind)
+    )
   except ValueError as exc:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -977,6 +1011,7 @@ async def create_model_from_state(req: CreateModelFromStateRequest, request: Req
     restore_optimizer=req.restore_optimizer,
     fine_tuning_type="full" if meta.fine_tuning_type == "full" else "lora",
     dtype=meta.trainer_dtype,
+    master_dtype=meta.master_dtype,
   )
   req_id = await launch_worker_and_enqueue(command) if worker_manager is not None else await enqueue(command)
   return {"request_id": req_id}
@@ -1174,7 +1209,26 @@ def checkpoint_info(path: str) -> dict[str, Any]:
   dtype = saved.get("dtype")
   if dtype is not None and dtype not in ("float32", "bfloat16"):
     raise ValueError(f"Checkpoint dtype must be float32 or bfloat16, got {dtype!r}")
-  return {"base_model": saved["base_model"], "is_lora": is_lora, "lora_rank": rank, "dtype": dtype, "type": "weights_info"}
+  master_dtype = saved.get("master_dtype")
+  if master_dtype is not None and master_dtype not in ("float32", "bfloat16"):
+    raise ValueError(f"Checkpoint master_dtype must be float32 or bfloat16, got {master_dtype!r}")
+  return {
+    "base_model": saved["base_model"],
+    "is_lora": is_lora,
+    "lora_rank": rank,
+    "dtype": dtype,
+    "master_dtype": master_dtype,
+    "type": "weights_info",
+  }
+
+
+def checkpoint_master_dtype(checkpoint: dict[str, Any], kind: str) -> str | None:
+  """The dtype a checkpoint's weights were trained in. One saved before
+  master_dtype was recorded: a full fine-tune trained in its dtype; a LoRA
+  adapter is not checked (the pytorch trainer kept it in float32 already)."""
+  if checkpoint.get("master_dtype") is not None:
+    return checkpoint["master_dtype"]
+  return checkpoint.get("dtype") if kind == "full" else None
 
 
 # *** SamplingClient endpoints ***

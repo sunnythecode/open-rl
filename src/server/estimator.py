@@ -62,10 +62,15 @@ def parameter_count(base_model: str) -> int | None:
 
 
 # Trainer on the device, at bfloat16: fft 8 B/param (weights + grads + two
-# AdamW moments, all bf16; there are no fp32 master weights), frozen base
+# AdamW moments, all bf16, i.e. master_dtype=bfloat16), frozen base
 # 2 B/param; plus activations. Every per-param and per-token figure in this
 # file is measured at bfloat16 and scales by DTYPE_SCALE for another dtype.
 TRAINER_DEVICE_BYTES_PER_PARAM = {"full": 8, "lora": 2}
+# fp32 master weights under bf16 compute add, per trained param, the 4 B fp32
+# master and 4 B for the two AdamW moments going from bf16 to fp32: 16 B/param
+# on the device, and the same 8 B more in host memory, where the offloaded
+# trainer parks them. LoRA adapters are too small to count.
+MASTER_WEIGHT_EXTRA_BYTES_PER_PARAM = 8
 TRAINER_DEVICE_RESERVE_BYTES = 4 * GIB
 # Sampler on the device: bf16 weights, vLLM's activation peak and CUDA graphs,
 # LoRA slot buffers (max_loras 8, rank 64) for a LoRA sampler, and a KV cache
@@ -121,7 +126,8 @@ def sampler_device_bytes(params: int, kv_bytes_per_token: int, kind: str, scale:
   return device + kv_bytes_per_token * scale * SAMPLER_KV_TOKENS
 
 
-def footprint(base_model: str, fine_tuning_type: str, role: str, dtype: str = "bfloat16") -> Footprint:
+def footprint(base_model: str, fine_tuning_type: str, role: str, dtype: str = "bfloat16", master_dtype: str | None = None) -> Footprint:
+  """master_dtype is the trainer's; None means the weights are stored in dtype."""
   model = normalize_model_id(base_model)
   if model not in MODEL_TO_PARAM_COUNT:
     logger.warning("No known parameter count for %r; sizing it as %s.", base_model, UNKNOWN_MODEL)
@@ -134,4 +140,7 @@ def footprint(base_model: str, fine_tuning_type: str, role: str, dtype: str = "b
   else:
     device = sampler_device_bytes(params, MODEL_TO_KV_BYTES_PER_TOKEN[model], kind, scale)
   host = params * HOST_BYTES_PER_PARAM[(kind, role)] * scale + HOST_OVERHEAD_BYTES[role]
+  if role == "trainer" and kind == "full" and master_dtype not in (None, dtype):
+    device += params * MASTER_WEIGHT_EXTRA_BYTES_PER_PARAM
+    host += params * MASTER_WEIGHT_EXTRA_BYTES_PER_PARAM
   return Footprint(device, host, int(host * HOST_LIMIT_FACTOR))

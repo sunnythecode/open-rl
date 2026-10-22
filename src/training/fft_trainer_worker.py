@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
-from training.trainer_worker import BaseTrainerWorker, Datum
+from training.master_weights import MasterWeightAdamW
+from training.trainer_worker import TORCH_DTYPES, BaseTrainerWorker, Datum
 from training.types import FFTConfig
 
 ENABLE_GRADIENT_CHECKPOINTING = os.getenv("ENABLE_GRADIENT_CHECKPOINTING", "1") == "1"
@@ -159,6 +160,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "dtype": self.dtype_name,
+      "master_dtype": self.master_dtype_name,
       "kind": "weights",
       "model_id": alias,
       "timestamp": time.time(),
@@ -199,6 +201,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "dtype": self.dtype_name,
+      "master_dtype": self.master_dtype_name,
       "kind": kind,
       "has_optimizer": False,
       "model_id": model_id,
@@ -265,6 +268,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       "base_model": self.base_model_name,
       "created_at": datetime.now().isoformat(),
       "dtype": self.dtype_name,
+      "master_dtype": self.master_dtype_name,
       "format": "sparse_delta",
       "format_version": SPARSE_DELTA_VERSION,
       "layer_shapes": layer_shapes,
@@ -314,7 +318,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
     if restore_optimizer and metadata.get("has_optimizer"):
       optimizer_path = os.path.join(state_path, "optimizer.pt")
       if os.path.exists(optimizer_path):
-        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=1e-4)
+        self.optimizer = self.new_optimizer(lr=1e-4)
         self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
         print(f"Restored optimizer state from {optimizer_path}")
 
@@ -330,6 +334,17 @@ class FFTTrainingWorker(BaseTrainerWorker):
       torch.cuda.empty_cache()
     return res
 
+  def new_optimizer(self, **adam_kwargs: Any) -> torch.optim.Optimizer:
+    """AdamW over the trainable parameters. With master_dtype wider than the
+    trainer dtype, the update runs on fp32 master copies held in the optimizer
+    state, and the bf16 parameters, which the sampler mirrors, get the masters
+    rounded after every step."""
+    if self.master_dtype_name == self.dtype_name:
+      print(f"Initializing AdamW for full fine-tuning in {self.dtype_name} with {adam_kwargs}")
+      return torch.optim.AdamW(self.trainable_params, **adam_kwargs)
+    print(f"Initializing AdamW over {self.master_dtype_name} master weights for {self.dtype_name} full fine-tuning with {adam_kwargs}")
+    return MasterWeightAdamW(self.trainable_params, master_dtype=TORCH_DTYPES[self.master_dtype_name], **adam_kwargs)
+
   def optim_step(self, adam_params: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
     assert self.model is not None, "Model must be loaded first."
     if torch.cuda.is_available():
@@ -344,14 +359,7 @@ class FFTTrainingWorker(BaseTrainerWorker):
       eps = adam_params.get("eps", 1e-12)
       weight_decay = adam_params.get("weight_decay", 0.0)
 
-      print(f"Initializing AdamW optimizer for full fine-tuning model with lr={lr}")
-      self.optimizer = torch.optim.AdamW(
-        self.trainable_params,
-        lr=lr,
-        betas=(beta1, beta2),
-        eps=eps,
-        weight_decay=weight_decay,
-      )
+      self.optimizer = self.new_optimizer(lr=lr, betas=(beta1, beta2), eps=eps, weight_decay=weight_decay)
 
     learning_rate = adam_params.get("learning_rate")
     if learning_rate is not None:
