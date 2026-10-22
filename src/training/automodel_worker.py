@@ -61,6 +61,15 @@ LORA_TARGETS = {
   "train_mlp": ("gate_proj", "up_proj", "down_proj"),
 }
 
+# The LoRA A/B weights, their grads and their AdamW moments are kept in fp32,
+# whatever trainer_dtype the frozen base runs in. Left unset, Automodel builds
+# them in the base's dtype, and a bf16 weight drops any Adam update below about
+# 2^-9 of its value, which covers most steps at RL learning rates. FSDP2's
+# MixedPrecisionPolicy still casts them to bf16 for the forward and backward.
+# PEFT does the same upcast on the LoRA worker (autocast_adapter_dtype), so
+# both backends train an adapter the same way.
+ADAPTER_DTYPE = torch.float32
+
 # Decoder layers per activation checkpoint. Automodel's own checkpointing wraps
 # attention and MLP separately and stashes four tensors per layer; a group of
 # whole layers stashes one. 0 turns it off.
@@ -286,6 +295,7 @@ class AutomodelTrainingWorker(BaseTrainerWorker):
       dropout=config.lora_dropout,
       lora_A_init="kaiming",
       use_triton=False,
+      lora_dtype=ADAPTER_DTYPE,
     )
 
   def is_ready(self) -> bool:

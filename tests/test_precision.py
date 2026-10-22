@@ -5,7 +5,9 @@ import asyncio
 import importlib.util
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -19,7 +21,7 @@ from server.store import InMemoryStateStore, InMemoryStore
 from server.worker_manager import worker_env
 from tests.test_session_lifecycle import RuntimeManager
 from training.trainer_worker import BaseTrainerWorker
-from training.types import SUPPORTED_DTYPES, check_dtypes, deployment_dtype
+from training.types import SUPPORTED_DTYPES, Datum, LoraConfig, TensorData, check_dtypes, deployment_dtype
 
 HAS_VLLM = importlib.util.find_spec("vllm") is not None
 
@@ -260,6 +262,67 @@ class TrainerWorkerPrecisionTest(unittest.TestCase):
   def test_a_bad_env_value_is_refused(self) -> None:
     with self.assertRaisesRegex(ValueError, "OPEN_RL_TRAINER_DTYPE"):
       self.worker("fp32")
+
+
+def stub_automodel_peft_config() -> dict[str, types.ModuleType]:
+  """sys.modules entries that make `from nemo_automodel.components._peft.lora
+  import PeftConfig` return a recorder of its kwargs."""
+  names = ["nemo_automodel", "nemo_automodel.components", "nemo_automodel.components._peft", "nemo_automodel.components._peft.lora"]
+  modules = {name: types.ModuleType(name) for name in names}
+  modules[names[-1]].PeftConfig = lambda **kwargs: kwargs
+  return modules
+
+
+class AdapterMasterWeightsTest(unittest.TestCase):
+  """A bf16 trainer keeps its LoRA weights and their AdamW state in fp32 on both
+  backends, so small updates are not rounded away. Only the frozen base and the
+  compute run in trainer_dtype."""
+
+  CONFIG = LoraConfig(rank=4, lora_alpha=8, lora_dropout=0.0)
+
+  def test_automodel_builds_fp32_adapters(self) -> None:
+    from training.automodel_worker import AutomodelTrainingWorker
+
+    with patch.dict(sys.modules, stub_automodel_peft_config()), patch.dict(os.environ, {"OPEN_RL_TRAINER_DTYPE": "bfloat16"}):
+      peft_config = AutomodelTrainingWorker().build_peft_config(self.CONFIG)
+    self.assertEqual(peft_config["lora_dtype"], torch.float32)
+
+  def test_lora_worker_trains_fp32_adapters_on_a_bf16_base(self) -> None:
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from training.lora_trainer_worker import LoraTrainingWorker
+
+    with patch.dict(os.environ, {"OPEN_RL_TRAINER_DTYPE": "bfloat16", "ENABLE_GRADIENT_CHECKPOINTING": "0"}):
+      worker = LoraTrainingWorker()
+    worker.device = torch.device("cpu")
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2)
+    worker.base_model = LlamaForCausalLM(config).to(torch.bfloat16)
+    worker.base_model_name = "tiny"
+    worker.create_adapter("a", self.CONFIG)
+
+    params = worker.adapter_states["a"]["trainable_params"]
+    self.assertEqual({param.dtype for param in params}, {torch.float32})
+    frozen = [param for param in worker.peft_model.parameters() if not param.requires_grad]
+    self.assertEqual({param.dtype for param in frozen}, {torch.bfloat16})
+
+    before = [param.detach().clone() for param in params]
+    targets = {"target_tokens": TensorData(data=[5, 8, 13, 21]), "weights": TensorData(data=[1.0] * 4)}
+    data = [Datum(model_input=[3, 5, 8, 13], loss_fn_inputs=targets)]
+    # lora_B starts at zero, so lora_A has no gradient until the second step.
+    # Each Adam step moves it by about lr, 1e-6 against entries near 0.25: a
+    # bf16 copy would not move at all.
+    for _ in range(2):
+      worker.forward_backward(data, "cross_entropy", model_id="a")
+      worker.optim_step({"learning_rate": 1e-6}, "a")
+
+    optimizer = worker.adapter_states["a"]["optimizer"]
+    for param in params:
+      self.assertEqual(optimizer.state[param]["exp_avg"].dtype, torch.float32)
+    lora_a = [(old, param) for old, param in zip(before, params, strict=True) if param.shape[0] == self.CONFIG.rank]
+    moved = sum(int((param.detach() != old).sum()) for old, param in lora_a)
+    total = sum(old.numel() for old, _ in lora_a)
+    self.assertGreater(moved / total, 0.9)
 
 
 @unittest.skipUnless(HAS_VLLM, "needs vllm")
